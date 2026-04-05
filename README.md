@@ -1,5 +1,9 @@
 # Approximating images with text
 
+Approximation   |  Targeted Image ([Friday Pilots Club](https://open.spotify.com/artist/3PgEvPJKRuil74QPX8wtXY?si=pXjOQP_ESNKRMYRthsO5uQ))
+:-------------------------:|:-------------------------:
+<img src="https://github.com/9Dread/stochastic-text-image-approximator/blob/main/example/ex_run.gif" alt="Algorithm example run gif" style="width:50%; height:auto;">  |  <img src="https://github.com/9Dread/stochastic-text-image-approximator/blob/main/example/fpc_in.png" alt="Targeted image of the band Friday Pilots Club" style="width:50%; height:auto;">
+
 This repository contains a toy project that takes as input an arbitrary target
 image, font file, and set of valid characters, and paints characters starting
 from a blank image in order to approximate the target image to high precision.
@@ -165,7 +169,7 @@ $$\lambda = \frac{\ln R}{a_{\max} - a_k}$$
 To promote early exploration we start with a lower $R$ and gradually increase
 it with more iterations to favor exploitation of the best candidates. The formula is 
 
-$$R = 10 + \sqrt{\text{iterations_completed}}$$
+$$R = 10 + \sqrt{\text{iterations completed}}$$
 
 which is rather simple but works well enough. $R$ is also capped at $80$.
 
