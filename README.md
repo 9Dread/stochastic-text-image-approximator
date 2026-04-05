@@ -1,8 +1,6 @@
 # Approximating images with text
 
-Approximation   |  Targeted Image ([Friday Pilots Club](https://open.spotify.com/artist/3PgEvPJKRuil74QPX8wtXY?si=pXjOQP_ESNKRMYRthsO5uQ))
-:-------------------------:|:-------------------------:
-<img src="https://github.com/9Dread/stochastic-text-image-approximator/blob/main/example/ex_run.gif" alt="Algorithm example run gif" style="width:50%; height:auto;">  |  <img src="https://github.com/9Dread/stochastic-text-image-approximator/blob/main/example/fpc_in.png" alt="Targeted image of the band Friday Pilots Club" style="width:50%; height:auto;">
+<img src="https://github.com/9Dread/stochastic-text-image-approximator/blob/main/example/ex_run.gif" alt="Algorithm example run gif" style="width:50%; height:auto;">
 
 This repository contains a toy project that takes as input an arbitrary target
 image, font file, and set of valid characters, and paints characters starting
