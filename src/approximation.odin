@@ -6,28 +6,23 @@ import "core:math"
 import "core:math/rand"
 import "core:fmt"
 import "core:slice"
+import "core:strings"
+import "core:strconv"
 
 import "core:thread"
 import "core:sync"
 import "base:runtime"
 
 //structs
-
 Frame :: struct {
 	x0, y0, w, h: int
-}
-Main_Object :: struct {
-	//main data structure we operate on
-	//each iteration.
-	curr: ^Image_Data,
-	glyphs: int,
 }
 
 One_Channel_Img :: struct {
 	w,h: int,
 	data: []int
 }
-One_Channel_Img_f32 :: struct { //def unidiomatic but im lazy
+One_Channel_Img_f32 :: struct { //definitely unidiomatic but im lazy
 	w,h: int,
 	data: []f32 
 }
@@ -51,6 +46,7 @@ Iter_Ctx :: struct {
 
     proposal_count: int,
 }
+
 Thread_Pool :: struct {
     threads: []^thread.Thread,
     locals: []Worker_Local,
@@ -66,12 +62,14 @@ Thread_Pool :: struct {
     //pointer to current iteration context (valid while generation active)
     ctx: ^Iter_Ctx,
 }
+
 Worker_Local :: struct {
     id: int,
     scale_vals: []f32,
     scores: []f32,
     bitmaps: []Glyph_Bitmap,
 }
+
 pool_init :: proc(num_threads: int, cache: Multiscale_SDF_Cache) -> ^Thread_Pool {
 	pool := new(Thread_Pool)
     pool.threads = make([]^thread.Thread, num_threads)
@@ -89,10 +87,12 @@ pool_init :: proc(num_threads: int, cache: Multiscale_SDF_Cache) -> ^Thread_Pool
     for i in 0..<num_threads {
         pool.threads[i] = thread.create(worker_main)
 		pool.threads[i].user_index=i
-		pool.threads[i].data = &pool //so that they can access their data
+		pool.threads[i].data = pool //so that they can access their data
+		thread.start(pool.threads[i])
     }
     return pool
 }
+
 pool_deinit :: proc(pool: ^Thread_Pool) {
     sync.lock(&pool.mu)
     pool.stop = true
@@ -105,7 +105,7 @@ pool_deinit :: proc(pool: ^Thread_Pool) {
 		thread.destroy(t)
     }
 
-    // free locals scratch
+    //free locals scratch
     for i in 0..<len(pool.locals) {
         delete(pool.locals[i].scale_vals)
         delete(pool.locals[i].scores)
@@ -114,6 +114,7 @@ pool_deinit :: proc(pool: ^Thread_Pool) {
     delete(pool.threads)
 	free(pool)
 }
+
 worker_main :: proc(t: ^thread.Thread) {
 	local_gen := 0
 	pool := (cast(^Thread_Pool)t.data)
@@ -148,6 +149,7 @@ worker_main :: proc(t: ^thread.Thread) {
         }
     }
 }
+
 compute_proposal :: proc(ctx: ^Iter_Ctx, wl: ^Worker_Local, i: int) {
 	//computes the proposal from context ctx and inserts it at index i
 	//in the context
@@ -168,7 +170,6 @@ compute_proposal :: proc(ctx: ^Iter_Ctx, wl: ^Worker_Local, i: int) {
 
 	//sample angle
 	theta := sample_rotation()
-
 
 	for j in 0..<len(cache.px_heights) {
 		dim := get_dimensions_from_cache(cache, cache.px_heights[j])
@@ -217,6 +218,135 @@ compute_proposal :: proc(ctx: ^Iter_Ctx, wl: ^Worker_Local, i: int) {
 	free_all(context.temp_allocator)
 }
 
+context_init :: proc(target: ^Image_Data, curr: ^Image_Data, cache: Multiscale_SDF_Cache,
+					proposal_count: int, R: f32) -> ^Iter_Ctx {
+	ctx := new(Iter_Ctx)
+	ctx.target = target
+	ctx.curr = curr
+	ctx.w = target.w
+	ctx.h = target.h
+	ctx.resid = make_resid_image(curr, target)
+	ctx.sq_resid = make_sq_residual_image(curr, target)
+	ctx.cache = cache
+	ctx.R = R
+	ctx.proposal_count = proposal_count
+	ctx.allocator = context.allocator
+	ctx.props = make([]Glyph, proposal_count, context.allocator)
+	ctx.improvements = make([]f32, proposal_count, context.allocator)
+	return ctx
+}
+context_deinit :: proc(ctx: ^Iter_Ctx) {
+	delete(ctx.resid.data)
+	delete(ctx.sq_resid.data)
+	delete(ctx.props)
+	delete(ctx.improvements)
+	free(ctx)
+}
+
+main_algorithm_par :: proc(target: ^Image_Data, final_iters: int, proposal_count: int,
+						cache: Multiscale_SDF_Cache, save_path:string, start_path:string,
+						num_threads: int, iters_done: int=0, save_iters: int=20) {
+	pool := pool_init(num_threads, cache)
+	defer pool_deinit(pool)
+
+	iters_done_f32 := f32(iters_done)
+	R := 10.0 + math.sqrt_f32(iters_done_f32)
+	R = 80.0 if R > 80.0 else R
+	curr: ^Image_Data
+	non_improve := 0
+	if start_path == "" {
+		//no starting point; start from scratch
+		curr = init_empty_rgba(target.w,target.h)
+	} else {
+		//start from the path
+		ok_start: bool
+		curr, ok_start = image_from_path(start_path)
+		ensure(ok_start)
+	}
+	ctx := context_init(target, curr, cache, proposal_count, R)
+	defer context_deinit(ctx)
+	pool.ctx = ctx
+	iters := 0
+	for iters<final_iters {
+		//update residual images
+		update_resid_image(ctx.curr, ctx.target, &ctx.resid)
+		update_sq_resid_image(ctx.curr, ctx.target, &ctx.sq_resid)
+		//make saliency table
+		saliency := blur(ctx.resid.data, ctx.resid.w, ctx.resid.h) 
+		normalize_vals(saliency.data)
+		ctx.saliency_tbl = init_alias_table(saliency.data)
+
+		sync.lock(&pool.mu)
+    	pool.ctx = ctx
+    	pool.next_job = 0
+    	pool.done = 0
+    	pool.generation += 1
+		sync.cond_broadcast(&pool.cv)
+
+		//wait for work to be done
+		for pool.done < len(pool.threads) && !pool.stop {
+		    sync.cond_wait(&pool.cv, &pool.mu)
+		}
+		sync.unlock(&pool.mu)
+
+		//softmax(ctx.improvements, ctx.R, 10)
+		//sample
+		//normalize_vals(ctx.improvements)
+		//tbl_g := init_alias_table(ctx.improvements)
+		//glyph_ind := sample_from_tbl(tbl_g)	
+		//deinit_alias_table(tbl_g)
+
+		//paint the glyph we selected *if it actually improves error*
+		//if ctx.improvements[glyph_ind] > 0 {
+		//	ok_paint := paint_glyph(ctx.curr, ctx.props[glyph_ind])
+		//	ensure(ok_paint)
+		//}
+
+		//select the best glyph
+		best_ind := -1
+		best_improvement: f32 = 0
+		for i in 0..<len(ctx.improvements) {
+    		if ctx.improvements[i] > best_improvement {
+        		best_improvement = ctx.improvements[i]
+        		best_ind = i
+    		}
+		}
+
+		if best_ind == -1 {
+			//if no improvement, don't paint
+    		fmt.println("No improving proposal found.")
+			non_improve += 1
+		} else {
+			ok_paint := paint_glyph(ctx.curr, ctx.props[best_ind])
+			ensure(ok_paint)
+		}
+
+		fmt.println("Iteration complete. Number of iterations done: ", iters,
+    	        " improvement: ", best_improvement, " number of non-improving iterations: " , non_improve)	
+		iters += 1
+		if iters % save_iters == 0 {
+			//save
+
+			//write the current iteration as a string
+			buf: [8]byte
+			iters_str := strconv.write_int(buf[:], i64(iters_done+iters), 10)
+			strings_to_combine := [4]string{save_path, "/iter", iters_str, ".png" }
+			save_file, err := strings.concatenate(strings_to_combine[:])
+			ensure(err == nil)
+			
+			ok_save := save_png(save_file, ctx.curr)
+			ensure(ok_save)
+			delete(save_file)
+
+		}
+
+		delete(saliency.data)
+		deinit_alias_table(ctx.saliency_tbl)
+		if ctx.R >= 80.0 do continue
+		ctx.R = 10.0 + math.sqrt_f32(iters_done_f32 + f32(iters))
+	}
+}
+
 sample_rotation :: proc() -> f32 {
 	//uniformly sample an angle
 	return rand.float32_range(0, 2*math.PI)
@@ -253,176 +383,6 @@ blur :: proc(arr: []int, w,h:int, range: int = 1) -> One_Channel_Img_f32 {
 
 Position :: struct {
 	x, y: int
-}
-
-main_algorithm :: proc(target: ^Image_Data, final_glyphs: int, proposal_count: int, 
-					cache: Multiscale_SDF_Cache, save_path:string, start_path:string, 
-					iters_done: int = 0, save_iters: int = 20) {
-	w := target.w
-	h := target.h
-	main_data := new(Main_Object)
-	if start_path == "" {
-		//no starting point; start from scratch
-		main_data.curr = init_empty_rgba(w,h)
-	} else {
-		//start from the path
-		ok_start: bool
-		main_data.curr, ok_start = image_from_path(start_path)
-		ensure(ok_start)
-	}
-	main_data.glyphs = 0
-	positions := make([]Position, proposal_count)
-	defer delete(positions)
-
-	scale_sample_vals := make([]f32, len(cache.px_heights)) //for sampling scales
-	defer delete(scale_sample_vals)	
-
-	heights := make([]f32, proposal_count)
-	defer delete(heights)
-	angles := make([]f32, proposal_count)
-	defer delete(angles)
-
-	auxiliary_bitmaps := make([]Glyph_Bitmap, len(cache.valid_codepoints))
-	defer delete(auxiliary_bitmaps)
-	bitmap_scores := make([]f32, len(cache.valid_codepoints))
-	defer delete(bitmap_scores)
-	final_bitmap_proposals := make([]Glyph_Bitmap, proposal_count)
-	defer delete(final_bitmap_proposals)
-
-	props := make([]Glyph, proposal_count)
-	defer delete(props)
-	improvements := make([]f32, proposal_count)
-	defer delete(improvements)
-
-	iters_done_f32 := f32(iters_done)
-	R := 10.0 + math.sqrt_f32(iters_done_f32)
-	R = 40.0 if R > 40.0 else R
-
-	for main_data.glyphs<final_glyphs {
-		resid := make_resid_image(main_data.curr, target)
-		sq_resid := make_sq_residual_image(main_data.curr, target)
-		saliency := blur(resid.data, resid.w, resid.h) 
-		//normalize saliency for alias sampling
-		normalize_vals(saliency.data)
-		tbl_saliency := init_alias_table(saliency.data)
-		
-		//sample proposal_count position indices
-		//using the alias method
-		for i in 0..<proposal_count {
-			index := sample_from_tbl(tbl_saliency)
-			pos_x := index % w 
-			pos_y := index / w 
-			positions[i].x = pos_x
-			positions[i].y = pos_y
-		}
-		deinit_alias_table(tbl_saliency)
-
-		//Next, sample scales.
-		//these depend on location;
-		//must be done independently
-		//for each sampled location
-
-		for i in 0..<proposal_count {
-			//set up the alias table for sampling
-			x := positions[i].x
-			y := positions[i].y
-			for j in 0..<len(cache.px_heights) {
-				dim := get_dimensions_from_cache(cache, cache.px_heights[j])
-				frame := frame_from_dimensions(x,y,dim)
-				scale_sample_vals[j] = energy_density_frame(sq_resid, frame)
-			}
-			numworst_ph := len(cache.px_heights)/3
-			if numworst_ph == 0 do numworst_ph += 1
-			softmax(scale_sample_vals, R, numworst_ph)
-			normalize_vals(scale_sample_vals)
-			tbl_scale := init_alias_table(scale_sample_vals)
-			
-			//sample and put the height into heights[i]
-			heights[i] = cache.px_heights[sample_from_tbl(tbl_scale)]
-			deinit_alias_table(tbl_scale)
-		}
-
-		//now we have a set of locations and scales.
-		//next we sample rotations (simple uniform
-		//since I'm too lazy to think of a heuristic)
-		for i in 0..<proposal_count {
-			angles[i] = sample_rotation()
-		}
-
-		//this is everything we need to get our bitmaps.
-		//now we just have to decide on glyph identity,
-		//then compute optimal color.
-		for i in 0..<proposal_count {
-			//start by getting all possible glyph identity bitmaps. We will
-			//sample a final one using a heuristic of this
-
-			for j in 0..<len(auxiliary_bitmaps) {
-				auxiliary_bitmaps[j] = get_bitmap(cache, heights[i], 
-												cache.valid_codepoints[j],
-												angles[i], 1.0, context.allocator) //was gonna use an arena, but on 2nd thought nvm
-				//compute score
-				bitmap_scores[j] = glyph_score(resid, auxiliary_bitmaps[j], positions[i].x, positions[i].y)
-			}
-			numworst := len(bitmap_scores)/3 //might be 0 if we have small dictionary; add 1
-			if numworst == 0 do numworst += 1
-			softmax(bitmap_scores, R, numworst)
-			normalize_vals(bitmap_scores)
-			tbl_scores := init_alias_table(bitmap_scores)
-			bitmap_index := sample_from_tbl(tbl_scores)
-			deinit_alias_table(tbl_scores)
-			final_bitmap_proposals[i] = auxiliary_bitmaps[bitmap_index]
-			for k in 0..<len(auxiliary_bitmaps) {
-				//free all bitmaps except the one we're keeping
-				if k == bitmap_index do continue
-				delete(auxiliary_bitmaps[k].mask)
-			}
-		}
-
-		//now we have everything except color
-		//this can be optimally computed analytically,
-		//then we can edit our slice of proposal glyphs
-		for i in 0..<proposal_count {
-			bitmap := final_bitmap_proposals[i]
-			x := positions[i].x
-			y := positions[i].y
-			optim_color := optimal_color(main_data.curr, target, bitmap, x, y)
-			props[i] = glyph_from_bmap(bitmap, x, y, optim_color[0], optim_color[1], optim_color[2])
-			improvements[i] = glyph_improvement(main_data.curr, target, props[i])
-		}
-		softmax(improvements, R, 10)
-		//sample
-		normalize_vals(improvements)
-		tbl_g := init_alias_table(improvements)
-		glyph_ind := sample_from_tbl(tbl_g)	
-		deinit_alias_table(tbl_g)
-		//paint the glyph we selected
-		ok_paint := paint_glyph(main_data.curr, props[glyph_ind])
-		ensure(ok_paint)
-
-		//free the glyphs
-		for k in 0..<len(improvements) {
-			delete(props[k].bmap)
-		}
-		main_data.glyphs += 1
-		fmt.println("Iteration complete. Number of glyphs painted: ", main_data.glyphs)
-		
-		if main_data.glyphs % save_iters == 0 {
-			//save
-			ok_save := save_png(save_path, main_data.curr)
-			ensure(ok_save)
-		}
-		
-		delete(sq_resid.data)
-		delete(resid.data)
-		delete(saliency.data)
-		if R >= 40.0 do continue
-		R = 10.0 + math.sqrt_f32(iters_done_f32 + f32(main_data.glyphs))
-	}
-	ok_save := save_png(save_path, main_data.curr)
-	ensure(ok_save)
-	fmt.println("Complete. New total iters done: ", iters_done+main_data.glyphs)
-	image_delete(main_data.curr)
-	
 }
 glyph_improvement :: proc(curr, target: ^Image_Data, g: Glyph) -> f32 {
 
@@ -590,11 +550,6 @@ energy_density_frame :: proc(energy: One_Channel_Img, f: Frame) -> f32 {
 	//sum of the squared residuals
 	//divided by the number of pixels.
 	//a simple heuristic to decide what glyph scales are "good"
-
-	//maybe improve later; this only tells us 
-	//whether there's a lot of error per pixel on average,
-	//not whether that error is all in the same *color direction*,
-	//which is what our glyph overlay kinda cares about.
 	total_resid := sq_residual_frame(energy, f)
 	return f32(total_resid)/f32(f.w * f.h)	
 }
@@ -649,6 +604,15 @@ make_sq_residual_image :: proc(approx, target: ^Image_Data) -> One_Channel_Img {
 	}
 	return One_Channel_Img{w=w,h=h,data=out}
 }
+update_sq_resid_image :: proc(approx, target: ^Image_Data, resid: ^One_Channel_Img) {
+	w := approx.w
+	h := approx.h
+	for y in 0..<h {
+		for x in 0..<w {
+			resid.data[y * w + x] = sq_residual_px(approx.pixels[y*w+x], target.pixels[y*w+x])
+		}
+	}
+}
 make_resid_image :: proc(approx, target: ^Image_Data) -> One_Channel_Img {
 	
 	assert(approx.w == target.w, "Incompatible image widths")
@@ -663,6 +627,15 @@ make_resid_image :: proc(approx, target: ^Image_Data) -> One_Channel_Img {
 		}
 	}
 	return One_Channel_Img{w=w,h=h,data=out}
+}
+update_resid_image :: proc(approx, target: ^Image_Data, resid: ^One_Channel_Img) {
+	w := approx.w
+	h := approx.h
+	for y in 0..<h {
+		for x in 0..<w {
+			resid.data[y * w + x] = resid_px(approx.pixels[y*w+x], target.pixels[y*w+x])
+		}
+	}
 }
 resid_px :: proc(approx: [4]u8, target: [4]u8) -> int {
 	res := 0
